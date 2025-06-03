@@ -4,6 +4,8 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"io"
+	"net/http"
 	"path/filepath"
 	"strings"
 
@@ -23,47 +25,77 @@ func runApp(inputPath string, forceOverwrite bool) ([]string, error) {
 
 	// Check if path exists
 	if _, err := os.Stat(inputPath); os.IsNotExist(err) {
-		// Return error immediately for path not existing, as it's a prerequisite.
 		return messages, fmt.Errorf("path '%s' does not exist", inputPath)
 	} else if err != nil {
 		return messages, fmt.Errorf("error checking path '%s': %w", inputPath, err)
 	}
 
-	messages = append(messages, fmt.Sprintf("Input path: %s", inputPath))
-	messages = append(messages, fmt.Sprintf("Force overwrite: %t", forceOverwrite))
+	messages = append(messages, fmt.Sprintf("INFO: Input path: %s", inputPath))
+	messages = append(messages, fmt.Sprintf("INFO: Force overwrite: %t", forceOverwrite))
 
 	files, err := filesystem.FindFiles(inputPath)
 	if err != nil {
-		// Return error for issues during file searching.
 		return messages, fmt.Errorf("error finding files: %w", err)
 	}
 
 	if len(files) == 0 {
-		messages = append(messages, "No processable files found.")
+		messages = append(messages, "INFO: No processable files found.")
 		return messages, nil
 	}
 
-	messages = append(messages, "Processing files...")
+	messages = append(messages, "INFO: Processing files...")
 	for _, fPath := range files {
-		ext := strings.ToLower(filepath.Ext(fPath))
-		if ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".gif" {
+		file, openErr := os.Open(fPath)
+		if openErr != nil {
+			messages = append(messages, fmt.Sprintf("ERROR: Error opening file %s: %v. Skipping.", fPath, openErr))
+			continue
+		}
+
+		buffer := make([]byte, 512)
+		n, readErr := file.Read(buffer)
+		if readErr != nil && readErr != io.EOF {
+			messages = append(messages, fmt.Sprintf("ERROR: Error reading file %s for content type detection: %v. Skipping.", fPath, readErr))
+			file.Close()
+			continue
+		}
+		mimeType := http.DetectContentType(buffer[:n])
+
+		_, seekErr := file.Seek(0, 0)
+		if seekErr != nil {
+			messages = append(messages, fmt.Sprintf("ERROR: Error seeking in file %s: %v. Skipping.", fPath, seekErr))
+			file.Close()
+			continue
+		}
+		// It's important to close the file if we are done with it here,
+		// or ensure ConvertToWebP handles an already open file (currently it reopens).
+		// For simplicity, closing it here is fine since ConvertToWebP reopens.
+		file.Close()
+
+		messages = append(messages, fmt.Sprintf("INFO: File: %s, Detected MIME type: %s", fPath, mimeType))
+
+		isSupportedMimeType := false
+		switch mimeType {
+		case "image/jpeg", "image/png", "image/gif":
+			isSupportedMimeType = true
+		}
+
+		if isSupportedMimeType {
 			baseName := strings.TrimSuffix(filepath.Base(fPath), filepath.Ext(fPath))
 			outputFilePath := filepath.Join(filepath.Dir(fPath), baseName+".webp")
 
 			errConv := converter.ConvertToWebP(fPath, outputFilePath, forceOverwrite)
 			if errConv != nil {
 				if strings.Contains(errConv.Error(), "already exists, use --force to overwrite") {
-					messages = append(messages, fmt.Sprintf("Skipping conversion (file exists): %s", outputFilePath))
+					// This specific error is more of a notice/skip condition if force is false.
+					messages = append(messages, fmt.Sprintf("INFO: Skipping conversion (file exists, based on content type): %s", outputFilePath))
 				} else {
-					// For other conversion errors, add to messages but don't necessarily stop all processing.
-					// Depending on desired strictness, could return error here.
-					messages = append(messages, fmt.Sprintf("Failed to convert %s: %v", fPath, errConv))
+					messages = append(messages, fmt.Sprintf("ERROR: Failed to convert %s (MIME: %s): %v", fPath, mimeType, errConv))
 				}
 			} else {
-				messages = append(messages, fmt.Sprintf("Successfully converted %s to %s", fPath, outputFilePath))
+				messages = append(messages, fmt.Sprintf("INFO: Successfully converted %s (MIME: %s) to %s", fPath, mimeType, outputFilePath))
 			}
 		} else {
-			messages = append(messages, fmt.Sprintf("Skipping non-image file: %s", fPath))
+			messages = append(messages, fmt.Sprintf("INFO: Skipping file %s (detected MIME type: %s, not a supported image format).", fPath, mimeType))
 		}
 	}
 	return messages, nil
@@ -78,7 +110,6 @@ func main() {
 
 	flag.Parse()
 
-	// Basic flag validation
 	if *path == "" {
 		fmt.Fprintln(os.Stderr, "Error: Input path is required. Use --path or -p.")
 		flag.Usage()
@@ -88,15 +119,16 @@ func main() {
 	messages, err := runApp(*path, *force)
 
 	for _, msg := range messages {
-		// Simple routing: if "Failed" or "Skipping conversion (file exists)", could go to Stderr or just Stdout.
-		// For this refactor, let's print all operational messages to Stdout.
-		// Critical errors from runApp (like path not existing) are handled below.
-		fmt.Println(msg)
+		if strings.HasPrefix(msg, "ERROR:") {
+			fmt.Fprintln(os.Stderr, msg)
+		} else {
+			// Default to Stdout for INFO and other messages
+			fmt.Println(msg)
+		}
 	}
 
 	if err != nil {
-		// Handle critical errors returned by runApp
-		fmt.Fprintf(os.Stderr, "Critical error: %v\n", err)
+		fmt.Fprintf(os.Stderr, "CRITICAL: %v\n", err)
 		// Determine exit code based on error type if needed
 		if errors.Is(err, os.ErrNotExist) || strings.Contains(err.Error(), "does not exist") {
 			os.Exit(2) // Specific exit code for path not found

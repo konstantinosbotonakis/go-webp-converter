@@ -15,11 +15,25 @@ import (
 )
 
 // Helper function to create a dummy image file for integration tests
+// This can be kept, or we can use a more generic file creator for some tests.
 func createIntegrationTestImage(t *testing.T, dir string, filename string, format string) string {
 	t.Helper()
 	filePath := filepath.Join(dir, filename)
-	img := image.NewRGBA(image.Rect(0, 0, 1, 1))
-	img.Set(0, 0, color.RGBA{255, 0, 0, 255}) // A single red pixel
+	var finalImg image.Image
+	rect := image.Rect(0, 0, 1, 1)
+
+	if strings.ToLower(format) == "gif" {
+		// For GIF, create a paletted image
+		palette := color.Palette([]color.Color{color.Transparent, color.RGBA{R: 255, A: 255}}) // Simple palette with red
+		palettedImg := image.NewPaletted(rect, palette)
+		palettedImg.SetColorIndex(0, 0, 1) // Set the pixel to the second color in the palette (red)
+		finalImg = palettedImg
+	} else {
+		// For PNG/JPEG, create an RGBA image
+		rgbaImg := image.NewRGBA(rect)
+		rgbaImg.Set(0, 0, color.RGBA{R: 255, A: 255}) // Red pixel
+		finalImg = rgbaImg
+	}
 
 	file, err := os.Create(filePath)
 	if err != nil {
@@ -29,15 +43,15 @@ func createIntegrationTestImage(t *testing.T, dir string, filename string, forma
 
 	switch strings.ToLower(format) {
 	case "png":
-		if err := png.Encode(file, img); err != nil {
+		if err := png.Encode(file, finalImg); err != nil {
 			t.Fatalf("Failed to encode test PNG %s: %v", filePath, err)
 		}
 	case "jpeg", "jpg":
-		if err := jpeg.Encode(file, img, nil); err != nil {
+		if err := jpeg.Encode(file, finalImg, nil); err != nil { // jpeg.Options can be nil for default
 			t.Fatalf("Failed to encode test JPEG %s: %v", filePath, err)
 		}
 	case "gif":
-		if err := gif.Encode(file, img, &gif.Options{NumColors: 1}); err != nil {
+		if err := gif.Encode(file, finalImg, &gif.Options{NumColors: 256}); err != nil {
 			t.Fatalf("Failed to encode test GIF %s: %v", filePath, err)
 		}
 	default:
@@ -45,6 +59,17 @@ func createIntegrationTestImage(t *testing.T, dir string, filename string, forma
 	}
 	return filePath
 }
+
+// Helper to create a file with specific content
+func createTestFile(t *testing.T, dir string, filename string, content []byte) string {
+	t.Helper()
+	filePath := filepath.Join(dir, filename)
+	if err := os.WriteFile(filePath, content, 0644); err != nil {
+		t.Fatalf("Failed to write test file %s: %v", filePath, err)
+	}
+	return filePath
+}
+
 
 func checkFileExists(t *testing.T, path string) {
 	t.Helper()
@@ -80,14 +105,31 @@ func TestIntegration_ConvertDirectory(t *testing.T) {
 	}
 	defer os.RemoveAll(tmpDir)
 
+	// Standard images
 	createIntegrationTestImage(t, tmpDir, "image1.png", "png")
 	createIntegrationTestImage(t, tmpDir, "image2.jpg", "jpeg")
 	createIntegrationTestImage(t, tmpDir, "image3.gif", "gif")
 
-	txtFilePath := filepath.Join(tmpDir, "document.txt")
-	if err := os.WriteFile(txtFilePath, []byte("hello world"), 0644); err != nil {
-		t.Fatalf("Failed to create test text file: %v", err)
+	// Text file with standard extension
+	txtFilePath := createTestFile(t, tmpDir, "document.txt", []byte("this is a plain text document"))
+
+	// Valid PNG image named image.txt
+	// Create a minimal valid PNG byte slice
+	var pngBytes []byte
+	img := image.NewRGBA(image.Rect(0, 0, 1, 1))
+	img.Set(0, 0, color.RGBA{0, 255, 0, 255}) // Green pixel
+	buf := new(strings.Builder) // Use strings.Builder as a temporary io.Writer
+	byteWriter := &byteWriter{buf}
+	if err := png.Encode(byteWriter, img); err != nil {
+		t.Fatalf("Failed to encode in-memory PNG: %v", err)
 	}
+	pngBytes = []byte(byteWriter.String()) // Get bytes from strings.Builder
+	imageTxtPath := createTestFile(t, tmpDir, "image.txt", pngBytes)
+
+
+	// Text file named document.jpg
+	docJPEGPath := createTestFile(t, tmpDir, "document.jpg", []byte("this is plain text, not a jpeg"))
+
 
 	messages, err := runApp(tmpDir, false)
 	if err != nil {
@@ -95,28 +137,45 @@ func TestIntegration_ConvertDirectory(t *testing.T) {
 	}
 
 	// Print messages for debugging
-	for _, msg := range messages {
-		fmt.Println(msg)
-	}
+	// for _, msg := range messages {
+	// 	fmt.Println(msg)
+	// }
 
-
+	// Check standard conversions
 	checkFileExists(t, filepath.Join(tmpDir, "image1.webp"))
 	checkFileExists(t, filepath.Join(tmpDir, "image2.webp"))
 	checkFileExists(t, filepath.Join(tmpDir, "image3.webp"))
-	checkFileDoesNotExist(t, filepath.Join(tmpDir, "document.webp"))
 
-	if !findMessage(messages, "Successfully converted "+filepath.Join(tmpDir, "image1.png")) {
-		t.Error("Missing success message for image1.png")
+	// Check skipping of actual text file
+	checkFileDoesNotExist(t, filepath.Join(tmpDir, "document.webp"))
+	if !findMessage(messages, "INFO: Skipping file "+txtFilePath+" (detected MIME type: text/plain") {
+		t.Errorf("Missing or incorrect skip message for document.txt. Messages: %v", messages)
 	}
-	if !findMessage(messages, "Successfully converted "+filepath.Join(tmpDir, "image2.jpg")) {
-		t.Error("Missing success message for image2.jpg")
+
+	// Check conversion of PNG file named image.txt
+	checkFileExists(t, filepath.Join(tmpDir, "image.webp")) // Output should be image.webp not image.txt.webp
+	if !findMessage(messages, "INFO: Successfully converted "+imageTxtPath) {
+		t.Errorf("Missing success message for %s (PNG disguised as .txt). Messages: %v", imageTxtPath, messages)
 	}
-	if !findMessage(messages, "Successfully converted "+filepath.Join(tmpDir, "image3.gif")) {
-		t.Error("Missing success message for image3.gif")
+	if !findMessage(messages, "INFO: File: "+imageTxtPath+", Detected MIME type: image/png") {
+		t.Errorf("Missing image/png MIME type detection message for %s. Messages: %v", imageTxtPath, messages)
 	}
-	if !findMessage(messages, "Skipping non-image file: "+txtFilePath) {
-		t.Error("Missing skip message for document.txt")
+
+
+	// Check skipping of text file named document.jpg
+	checkFileDoesNotExist(t, filepath.Join(tmpDir, "document.webp")) // Output should be document.webp
+	if !findMessage(messages, "INFO: Skipping file "+docJPEGPath+" (detected MIME type: text/plain") {
+		t.Errorf("Missing or incorrect skip message for %s (text disguised as .jpg). Messages: %v", docJPEGPath, messages)
 	}
+}
+
+// byteWriter to satisfy io.Writer for png.Encode with a strings.Builder
+type byteWriter struct {
+	*strings.Builder
+}
+
+func (bw *byteWriter) Write(p []byte) (int, error) {
+	return bw.WriteString(string(p))
 }
 
 func TestIntegration_ForceOverwrite(t *testing.T) {
@@ -135,7 +194,7 @@ func TestIntegration_ForceOverwrite(t *testing.T) {
 		t.Fatalf("runApp (1st run) failed: %v. Messages: %v", errRun1, messages)
 	}
 	checkFileExists(t, webpPath)
-	if !findMessage(messages, "Successfully converted "+pngPath) {
+	if !findMessage(messages, "INFO: Successfully converted "+pngPath) {
 		t.Error("Missing success message for image.png on 1st run")
 	}
 	stat1, _ := os.Stat(webpPath)
@@ -146,8 +205,9 @@ func TestIntegration_ForceOverwrite(t *testing.T) {
 	if errRun2 != nil {
 		t.Fatalf("runApp (2nd run, no force) failed: %v. Messages: %v", errRun2, messages)
 	}
-	if !findMessage(messages, "Skipping conversion (file exists): "+webpPath) {
-		t.Errorf("Expected skip message for existing file on 2nd run (no force), got: %v", messages)
+	expectedSkipMessage := fmt.Sprintf("INFO: Skipping conversion (file exists, based on content type): %s", webpPath)
+	if !findMessage(messages, expectedSkipMessage) {
+		t.Errorf("Expected skip message '%s' on 2nd run (no force), got: %v", expectedSkipMessage, messages)
 	}
 	stat2, _ := os.Stat(webpPath)
 	if stat1.ModTime() != stat2.ModTime() {
@@ -162,7 +222,7 @@ func TestIntegration_ForceOverwrite(t *testing.T) {
 	if errRun3 != nil {
 		t.Fatalf("runApp (3rd run, with force) failed: %v. Messages: %v", errRun3, messages)
 	}
-	if !findMessage(messages, "Successfully converted "+pngPath) {
+	if !findMessage(messages, "INFO: Successfully converted "+pngPath) {
 		t.Errorf("Missing success message for image.png on 3rd run (with force), got messages: %v", messages)
 	}
 	stat3, _ := os.Stat(webpPath)
@@ -195,7 +255,7 @@ func TestIntegration_SingleFile(t *testing.T) {
 	}
 
 	checkFileExists(t, expectedWebpPath)
-	if !findMessage(messages, "Successfully converted "+pngPath) {
+	if !findMessage(messages, "INFO: Successfully converted "+pngPath) {
 		t.Error("Missing success message for single.png")
 	}
 }
